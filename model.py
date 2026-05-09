@@ -467,13 +467,10 @@ class MimiWav2Vec2Bridge(nn.Module):
             max_seq_len=m["max_seq_len"],
         )
 
-        # 6. Output projection for training loss (applied to last_hidden_state only)
-        #    Identity since d_model == output_dim == 768; kept for flexibility.
-        self.output_proj = nn.Sequential(
-            nn.Linear(m["d_model"], m["d_model"]),
-            nn.GELU(),
-            nn.Linear(m["d_model"], m["output_dim"]),
-        )
+        # Note: no output_proj needed — d_model == output_dim == 768.
+        # Adding a projection here would create unused parameters in DDP
+        # (only last_hidden_state participates in the MSE loss, and it is
+        # already 768-dim straight from the transformer).
 
         self._init_weights()
 
@@ -528,20 +525,18 @@ class MimiWav2Vec2Bridge(nn.Module):
         )
         # x == last_hidden_state  (B, 2T, 768)
 
-        # ── Output projection (for training MSE loss) ─────────────────────────
-        projected = self.output_proj(x)  # (B, 2T, 768)  — same dim
-
         # ── Build output object ───────────────────────────────────────────────
+        # x is already 768-dim (d_model == output_dim); no projection needed.
+        # last_hidden_state == hidden_states[-1] — matches wav2vec2 behaviour.
         if output_hidden_states:
-            # 13 tensors: h0 + outputs of layers 1..12
-            # layer_hidden_states is a tuple of 12 items (one per transformer layer)
+            # 13 tensors: h0 (pre-encoder) + outputs of layers 1..12
             all_hidden = (h0,) + layer_hidden_states  # len == 13
         else:
             all_hidden = None
 
         output = Wav2Vec2LikeOutput(
-            last_hidden_state=x,         # (B, 2T, 768)  — raw, before output_proj
-            hidden_states=all_hidden,    # 13 × (B, 2T, 768) or None
+            last_hidden_state=x,       # (B, 2T, 768)
+            hidden_states=all_hidden,  # 13 × (B, 2T, 768) or None
         )
 
         return output, present_kvs
