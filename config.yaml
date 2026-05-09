@@ -1,0 +1,133 @@
+# ============================================================
+# Mimi-to-Wav2Vec2 Bridge Module — Full Configuration
+# Teacher : facebook/wav2vec2-base-960h  (768-dim, 25 Hz)
+# Target  : Exact architectural match with wav2vec2-base so that
+#           the bridge is a drop-in replacement in AvatarForcing.
+#
+# AvatarForcing settings (avatarforcing.yaml):
+#   fps         = 25 Hz
+#   teacher_len = 80  (default, overridable)
+#   audio rate  = fps × (1/fps) = 25 Hz output rate
+#
+# Bridge audio math:
+#   Mimi encoder output rate = 12.5 Hz
+#   upsample_factor = 2  →  12.5 × 2 = 25 Hz  ✓ matches AvatarForcing
+#
+# AvatarForcing concat format:
+#   audio_emb = last_hidden_state + cat(hidden_states)   # 14 × 768 = 10752
+#
+# Launch with:
+#   torchrun --nproc_per_node=4 train.py --config config.yaml
+# ============================================================
+
+model:
+  # --- Embedding ---
+  num_codebooks: 8
+  vocab_size: 2048
+  embed_dim: 256              # per-codebook embedding dim before projection
+  embed_fusion: "sum"         # "sum" | "concat"
+
+  # --- Temporal Upsampling ---
+  # Mimi outputs at 12.5 Hz; AvatarForcing uses fps=25 Hz.
+  # upsample_factor = 25 / 12.5 = 2  →  12.5 Hz × 2 = 25 Hz ✓
+  upsample_factor: 2
+  upsample_kernel: 2
+
+  # --- Transformer  (matches facebook/wav2vec2-base-960h exactly) ---
+  d_model: 768               # MUST equal output_dim (all hidden states are 768-dim)
+  nhead: 12                  # 768 / 12 = 64 head_dim  (wav2vec2-base: 12 heads)
+  num_layers: 12             # wav2vec2-base has 12 transformer layers
+  dim_feedforward: 3072      # 4 × 768  (wav2vec2-base FFN size)
+  dropout: 0.1
+  causal: true
+  pos_encoding: "relative"
+  max_seq_len: 2048
+
+  # --- Output ---
+  output_dim: 768            # facebook/wav2vec2-base-960h hidden size
+  #
+  # Full AvatarForcing concat dim = 14 × 768 = 10752
+  #   last_hidden_state  (1 × 768)
+  # + hidden_states      (13 × 768):
+  #     [0]  pre-encoder features (post upsample, pre transformer)
+  #     [1..12]  output of each of the 12 transformer layers
+
+training:
+  # ── Per-GPU batch size ────────────────────────────────────────────────────
+  # 4 GPUs × 16 per-GPU × 1 accum = 64 effective batch
+  # The model is larger (12 layers, d_model=768) so reduce from 32 to 16
+  # to stay within 24 GB VRAM. Raise accum_steps to keep effective batch size.
+  batch_size: 16
+
+  # ── Gradient accumulation ─────────────────────────────────────────────────
+  # effective_batch = batch_size × world_size × accum_steps
+  # 16 × 4 × 2 = 128  (good default for wav2vec2-scale model)
+  accum_steps: 2
+
+  num_epochs: 50
+
+  # Scaled learning rate: base_lr × sqrt(effective_batch / 16)
+  # base = 1e-4 → 1e-4 × sqrt(128/16) ≈ 2.83e-4
+  learning_rate: 2.8e-4
+  weight_decay: 1.0e-5
+  lr_scheduler: "cosine"
+  # warmup_steps counts optimizer steps (after accumulation)
+  warmup_steps: 1000
+  grad_clip: 1.0
+  mixed_precision: true       # BF16 on RTX 4090
+  seed: 42
+
+  compile: false
+
+  # --- Loss Weights ---
+  loss_weights:
+    recon:      1.0
+    ctc:        0.3
+    prosody:    0.2
+    adv:        0.1
+    stat:       0.1
+    smooth:     0.05
+    alignment:  0.0
+
+  # --- Discriminator ---
+  disc_lr: 2.0e-4
+  disc_start_step: 5000
+  disc_hidden: 512
+  disc_layers: 4
+
+  # --- CTC / ASR head ---
+  ctc_vocab_size: 31
+  freeze_ctc_head: true
+
+  # --- Prosody ---
+  f0_min: 50.0
+  f0_max: 600.0
+  hop_length: 160
+
+data:
+  sample_rate: 16000
+  mimi_sample_rate: 24000       # Mimi requires 24kHz input audio
+  mimi_rate: 12.5               # Mimi encoder output frame rate (Hz)
+
+  # AvatarForcing uses fps=25 Hz output rate.
+  # bridge output rate = mimi_rate × upsample_factor = 12.5 × 2 = 25 Hz ✓
+  wav2vec2_feat_rate: 25.0      # GT target rate (Hz) — matches AvatarForcing fps
+  wav2vec2_native_rate: 50.0    # native wav2vec2 CNN output rate before interp
+  max_audio_seconds: 20.0
+  train_manifest: "data/train.jsonl"
+  val_manifest: "data/val.jsonl"
+  num_workers: 4
+  cache_features: true
+  cache_dir: "data/cache"
+
+paths:
+  wav2vec2_model: "facebook/wav2vec2-base-960h"
+  mimi_model: "kyutai/moshiko-pytorch-bf16"
+  checkpoint_dir: "checkpoints"
+  log_dir: "logs"
+  tensorboard: true
+
+inference:
+  chunk_size: 50
+  kv_cache: true
+  device: "cuda"
